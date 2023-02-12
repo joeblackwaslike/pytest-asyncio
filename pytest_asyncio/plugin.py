@@ -76,8 +76,6 @@ both pytest-asyncio and pytest-trio are used in the same project)
 """
 
 
-
-
 class Task311(asyncio.tasks._PyTask):
     """
     This is backport of Task from CPython 3.11
@@ -112,25 +110,10 @@ class Task311(asyncio.tasks._PyTask):
         asyncio.tasks._register_task(self)
 
 
-def task_factory(loop, coro, context=None):
-    stack = traceback.extract_stack()
-    for frame in stack[-2::-1]:
-        package_name = Path(frame.filename).parts[-2]
-        if package_name != "asyncio":
-            if package_name == "pytest_asyncio":
-                # This function was called from pytest_asyncio, use shared context
-                break
-            else:
-                # This function was called from somewhere else, create context copy
-                context = None
-            break
-    return Task311(coro, loop=loop, context=context)
-
-
 class Task311EventLoopPolicy(asyncio.DefaultEventLoopPolicy):
     def _set_311_task_factory(self, loop):
         loop.set_task_factory(
-            functools.partial(task_factory, context=contextvars.copy_context())
+            functools.partial(self.task_factory, context=contextvars.copy_context())
         )
 
     def get_event_loop(self):
@@ -142,21 +125,57 @@ class Task311EventLoopPolicy(asyncio.DefaultEventLoopPolicy):
         loop = super().new_event_loop()
         self._set_311_task_factory(loop)
         return loop
+    
+    @staticmethod
+    def task_factory(loop, coro, context=None):
+        stack = traceback.extract_stack()
+        for frame in stack[-2::-1]:
+            package_name = Path(frame.filename).parts[-2]
+            if package_name != "asyncio":
+                if package_name == "pytest_asyncio":
+                    # This function was called from pytest_asyncio, use shared context
+                    break
+                else:
+                    # This function was called from somewhere else, create context copy
+                    context = None
+                break
+        return Task311(coro, loop=loop, context=context)
 
+
+def get_loop_scope(fixture_name: str, config: Config) -> _ScopeName:
+    if fixture_name in ["event_loop_policy", "event_loop"]:
+        scope = _parse_config_option(config, "loop_scope")
+        return cast(_ScopeName, scope)
+    return "function"
+
+def get_event_loop_policy(py311_task_enabled: bool = False):
+    if py311_task_enabled:
+        return Task311EventLoopPolicy()
+    else:
+        return asyncio.get_event_loop_policy()
 
 @contextlib.contextmanager
-def patched_event_loop_factory(request: FixtureRequest):
-    enable_py311_task = _get_py311_task(request.config)
-    if enable_py311_task:
-        policy = Task311EventLoopPolicy()
+def get_event_loop(policy: asyncio.DefaultEventLoopPolicy, new=True):
+    if new is True:
+        loop = policy.new_event_loop()
     else:
-        policy = asyncio.get_event_loop_policy()
-    
-    loop = policy.new_event_loop()
-
+        loop = policy.get_event_loop()
     yield loop
-
     loop.close()
+
+
+@pytest.fixture(scope=get_loop_scope)
+def event_loop_policy(request: FixtureRequest) -> asyncio.DefaultEventLoopPolicy:
+    enable_py311_task = _parse_config_option(request.config, "py311_task")
+    return get_event_loop_policy(enable_py311_task)
+
+
+@pytest.fixture(scope=get_loop_scope)
+def event_loop(event_loop_policy: asyncio.DefaultEventLoopPolicy) -> Iterator[asyncio.AbstractEventLoop]:
+    """Create an instance of the default event loop for each test case."""
+    # enable_py311_task = _parse_config_option(request.config, "py311_task")
+    with get_event_loop(event_loop_policy) as loop:
+        yield loop
 
 
 def pytest_addoption(parser: Parser, pluginmanager: PytestPluginManager) -> None:
@@ -178,7 +197,7 @@ def pytest_addoption(parser: Parser, pluginmanager: PytestPluginManager) -> None
         "--py311-task",
         dest="py311_task",
         default=None,
-        action="store_true",
+        action="store",
         help="Enable an experimental context propagation patch from python 3.11 for asyncio.Task",
     )
     parser.addini(
@@ -187,6 +206,28 @@ def pytest_addoption(parser: Parser, pluginmanager: PytestPluginManager) -> None
         help="Enable an experimental context propagation patch from python 3.11 for asyncio.Task",
         default=False,
     )
+
+    group.addoption(
+        "--loop-scope",
+        dest="loop_scope",
+        default="function",
+        action="store",
+        choices=["function", "class", "module", "package", "session"],
+        help="Desired scope for the event_loop pytest fixture",
+    )
+    parser.addini(
+        "loop_scope",
+        type="bool",
+        help="Desired scope for the event_loop pytest fixture",
+        default="function",
+    )
+
+
+def _parse_config_option(config: Config, name: str, unset: Any = None):
+    val = config.getoption(name)
+    if val is unset:
+        val = config.getini(name)
+    return val
 
 
 @overload
@@ -260,19 +301,6 @@ def _is_coroutine_or_asyncgen(obj: Any) -> bool:
     return _is_coroutine(obj) or inspect.isasyncgenfunction(obj)
 
 
-def _get_asyncio_mode(config: Config) -> Mode:
-    val = config.getoption("asyncio_mode")
-    if val is None:
-        val = config.getini("asyncio_mode")
-    return Mode(val)
-
-def _get_py311_task(config: Config) -> Mode:
-    val = config.getoption("py311_task")
-    if val is None:
-        val = config.getini("py311_task")
-    return val
-
-
 def pytest_configure(config: Config) -> None:
     """Inject documentation."""
     config.addinivalue_line(
@@ -286,15 +314,25 @@ def pytest_configure(config: Config) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_report_header(config: Config) -> List[str]:
     """Add asyncio config to pytest header."""
-    mode = _get_asyncio_mode(config)
+    mode = Mode(_parse_config_option(config, "asyncio_mode"))
     return [f"asyncio: mode={mode}"]
 
+extension_options = {}
 
 def _preprocess_async_fixtures(
     config: Config,
     processed_fixturedefs: Set[FixtureDef],
 ) -> None:
-    asyncio_mode = _get_asyncio_mode(config)
+    asyncio_mode = Mode(_parse_config_option(config, "asyncio_mode"))
+    py311_task = _parse_config_option(config, "py311_task")
+    loop_scope = _parse_config_option(config, "loop_scope")
+    extension_options.clear()
+    extension_options.update(
+        asyncio_mode=asyncio_mode,
+        py311_task=py311_task,
+        loop_scope=loop_scope,
+    )
+
     fixturemanager = config.pluginmanager.get_plugin("funcmanage")
     for fixtures in fixturemanager._arg2fixturedefs.values():
         for fixturedef in fixtures:
@@ -489,7 +527,7 @@ def pytest_collection_modifyitems(
       - Hypothesis tests wrapping coroutines
 
     """
-    if _get_asyncio_mode(config) != Mode.AUTO:
+    if Mode(_parse_config_option(config, "asyncio_mode")) != Mode.AUTO:
         return
     function_items = (item for item in items if isinstance(item, Function))
     for function_item in function_items:
@@ -569,21 +607,25 @@ _UNCLOSED_EVENT_LOOP_WARNING = dedent(
 
 def _close_event_loop() -> None:
     policy = asyncio.get_event_loop_policy()
+
     try:
         loop = policy.get_event_loop()
     except RuntimeError:
         loop = None
-    if loop is not None:
-        # Emit ResourceWarnings in the context of the fixture/test case
-        # rather than waiting for the interpreter to trigger the warning when
-        # garbage collecting the event loop.
-        if not loop.is_closed():
-            warnings.warn(
-                _UNCLOSED_EVENT_LOOP_WARNING % loop,
-                ResourceWarning,
-                source=loop,
-            )
-        loop.close()
+    else:
+        if loop is not None:
+            # Emit ResourceWarnings in the context of the fixture/test case
+            # rather than waiting for the interpreter to trigger the warning when
+            # garbage collecting the event loop.
+            if not loop.is_closed():
+                warnings.warn(
+                    _UNCLOSED_EVENT_LOOP_WARNING % loop,
+                    ResourceWarning,
+                    source=loop,
+                )
+    finally:
+        if loop:
+            loop.close()
 
 
 def _provide_clean_event_loop() -> None:
@@ -690,18 +732,6 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             "test function `%r` is using Hypothesis, but pytest-asyncio "
             "only works with Hypothesis 3.64.0 or later." % item
         )
-
-
-@pytest.fixture
-def event_loop(request: FixtureRequest) -> Iterator[asyncio.AbstractEventLoop]:
-    """Create an instance of the default event loop for each test case."""
-    with patched_event_loop_factory(request) as loop:
-        yield loop
-
-
-
-
-    
 
 
 def _unused_port(socket_type: int) -> int:
