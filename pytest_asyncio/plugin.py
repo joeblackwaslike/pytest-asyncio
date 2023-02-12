@@ -1,8 +1,11 @@
 """pytest-asyncio implementation."""
 import asyncio
 import contextlib
+import contextvars
 import enum
 import functools
+import traceback
+from pathlib import Path
 import inspect
 import socket
 import sys
@@ -73,6 +76,89 @@ both pytest-asyncio and pytest-trio are used in the same project)
 """
 
 
+
+
+class Task311(asyncio.tasks._PyTask):
+    """
+    This is backport of Task from CPython 3.11
+    It's needed to allow context passing
+    """
+
+    def __init__(self, coro, *, loop=None, name=None, context=None):
+        super(asyncio.tasks._PyTask, self).__init__(loop=loop)
+        if self._source_traceback:
+            del self._source_traceback[-1]
+        if not asyncio.coroutines.iscoroutine(coro):
+            # raise after Future.__init__(), attrs are required for __del__
+            # prevent logging for pending task in __del__
+            self._log_destroy_pending = False
+            raise TypeError(f"a coroutine was expected, got {coro!r}")
+
+        if name is None:
+            self._name = f"Task-{asyncio.tasks._task_name_counter()}"
+        else:
+            self._name = str(name)
+
+        self._num_cancels_requested = 0
+        self._must_cancel = False
+        self._fut_waiter = None
+        self._coro = coro
+        if context is None:
+            self._context = contextvars.copy_context()
+        else:
+            self._context = context
+
+        self._loop.call_soon(self._Task__step, context=self._context)
+        asyncio.tasks._register_task(self)
+
+
+def task_factory(loop, coro, context=None):
+    stack = traceback.extract_stack()
+    for frame in stack[-2::-1]:
+        package_name = Path(frame.filename).parts[-2]
+        if package_name != "asyncio":
+            if package_name == "pytest_asyncio":
+                # This function was called from pytest_asyncio, use shared context
+                break
+            else:
+                # This function was called from somewhere else, create context copy
+                context = None
+            break
+    return Task311(coro, loop=loop, context=context)
+
+
+class Task311EventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+    def _set_311_task_factory(self, loop):
+        loop.set_task_factory(
+            functools.partial(task_factory, context=contextvars.copy_context())
+        )
+
+    def get_event_loop(self):
+        loop = super().get_event_loop()
+        self._set_311_task_factory(loop)
+        return loop
+
+    def new_event_loop(self):
+        loop = super().new_event_loop()
+        self._set_311_task_factory(loop)
+        return loop
+
+
+@contextlib.contextmanager
+def patched_event_loop_factory(request: FixtureRequest):
+    enable_py311_task = _get_py311_task(request.config)
+    if enable_py311_task:
+        policy = Task311EventLoopPolicy()
+    else:
+        policy = asyncio.get_event_loop_policy()
+    
+    loop = policy.new_event_loop()
+
+    yield loop
+
+    loop.close()
+
+
 def pytest_addoption(parser: Parser, pluginmanager: PytestPluginManager) -> None:
     group = parser.getgroup("asyncio")
     group.addoption(
@@ -86,6 +172,20 @@ def pytest_addoption(parser: Parser, pluginmanager: PytestPluginManager) -> None
         "asyncio_mode",
         help="default value for --asyncio-mode",
         default="strict",
+    )
+
+    group.addoption(
+        "--py311-task",
+        dest="py311_task",
+        default=None,
+        action="store_true",
+        help="Enable an experimental context propagation patch from python 3.11 for asyncio.Task",
+    )
+    parser.addini(
+        "py311_task",
+        type="bool",
+        help="Enable an experimental context propagation patch from python 3.11 for asyncio.Task",
+        default=False,
     )
 
 
@@ -165,6 +265,12 @@ def _get_asyncio_mode(config: Config) -> Mode:
     if val is None:
         val = config.getini("asyncio_mode")
     return Mode(val)
+
+def _get_py311_task(config: Config) -> Mode:
+    val = config.getoption("py311_task")
+    if val is None:
+        val = config.getini("py311_task")
+    return val
 
 
 def pytest_configure(config: Config) -> None:
@@ -280,22 +386,54 @@ def _wrap_asyncgen_fixture(fixturedef: FixtureDef) -> None:
             res = await gen_obj.__anext__()
             return res
 
+        async def async_finalizer() -> None:
+            try:
+                await gen_obj.__anext__()
+            except StopAsyncIteration:
+                pass
+            else:
+                msg = "Async generator fixture didn't stop."
+                msg += "Yield only once."
+                raise ValueError(msg)
+
+        in_event = asyncio.Event()
+        out_queue = asyncio.Queue()
+
+        async def fixture_runner():
+            try:
+                result = await setup()
+            except Exception as exc:
+                out_queue.put_nowait((None, exc))
+            else:
+                out_queue.put_nowait((result, None))
+            await in_event.wait()
+            try:
+                await async_finalizer()
+            except Exception as exc:
+                out_queue.put_nowait(exc)
+            else:
+                out_queue.put_nowait(None)
+
+        task = event_loop.create_task(fixture_runner())
+
         def finalizer() -> None:
             """Yield again, to finalize."""
 
-            async def async_finalizer() -> None:
+            async def finalize():
+                in_event.set()
                 try:
-                    await gen_obj.__anext__()
-                except StopAsyncIteration:
-                    pass
-                else:
-                    msg = "Async generator fixture didn't stop."
-                    msg += "Yield only once."
-                    raise ValueError(msg)
+                    exc = await out_queue.get()
+                    if exc is not None:
+                        raise exc
+                finally:
+                    await task
 
-            event_loop.run_until_complete(async_finalizer())
+            event_loop.run_until_complete(finalize())
 
-        result = event_loop.run_until_complete(setup())
+        result, exc = event_loop.run_until_complete(out_queue.get())
+        if exc:
+            raise exc
+       
         request.addfinalizer(finalizer)
         return result
 
@@ -557,9 +695,13 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 @pytest.fixture
 def event_loop(request: FixtureRequest) -> Iterator[asyncio.AbstractEventLoop]:
     """Create an instance of the default event loop for each test case."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+    with patched_event_loop_factory(request) as loop:
+        yield loop
+
+
+
+
+    
 
 
 def _unused_port(socket_type: int) -> int:
