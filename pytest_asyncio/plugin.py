@@ -93,7 +93,7 @@ class Task311(asyncio.tasks._PyTask):
             raise TypeError(f"a coroutine was expected, got {coro!r}")
 
         if name is None:
-            self._name = f"Task-{asyncio.tasks._task_name_counter()}"
+            self._name = f"Task-{id(self)}"
         else:
             self._name = str(name)
 
